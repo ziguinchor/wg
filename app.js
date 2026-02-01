@@ -1,9 +1,22 @@
+/**
+ * wg-control (ESM)
+ * Auth: JWT + bcrypt
+ *
+ * Install:
+ *   npm i express better-sqlite3 nanoid jsonwebtoken bcryptjs
+ *
+ * Run (needs root for `wg set`):
+ *   sudo node app.js
+ */
+
 import express from "express";
 import Database from "better-sqlite3";
 import { nanoid } from "nanoid";
 import { execFileSync } from "child_process";
 import fs from "fs";
 import path from "path";
+import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
 
 /**
  * =========================
@@ -13,7 +26,7 @@ import path from "path";
 const CONFIG = {
   WG_IFACE: "wg0",
   SERVER_ENDPOINT: "51.222.139.224:51820", // or "[IPv6]:51820"
-  SERVER_PUBLIC_KEY: "afNgr4DPvJgPotG0v5sERQEBkIGjBB9fBfV2zkSnOGM=",
+  SERVER_PUBLIC_KEY: "PUT_SERVER_PUBLIC_KEY_HERE",
   DNS: "1.1.1.1, 8.8.8.8",
   VPN_IP_PREFIX: "10.0.0.", // allocates 10.0.0.2 .. 10.0.0.254
   CLIENT_MTU: 1420,
@@ -21,7 +34,24 @@ const CONFIG = {
 
   // Logging
   LOG_DIR: "./logs",
-  LOG_FILE: "wg-control.log"
+  LOG_FILE: "wg-control.log",
+
+  // JWT settings
+  JWT: {
+    // IMPORTANT: change this to a long random string
+    SECRET: "CHANGE_ME_TO_A_LONG_RANDOM_SECRET_64+_CHARS",
+    EXPIRES_IN: "12h",
+    ISSUER: "wg-control"
+  },
+
+  // Admin account (bcrypt hash). Generate with /setup/hash below, then paste here.
+  ADMIN: {
+    USERNAME: "admin",
+    // Default is hash for password: "change-this-strong-password"
+    // You should generate your own and replace this.
+    PASSWORD_BCRYPT:
+      "$2b$10$.jnMPA/bYTRADKpmcCqn1.tClAsF946OLdfwLPselAlmsdKhW6Ov6"
+  }
 };
 
 /**
@@ -38,21 +68,15 @@ function nowIso() {
 }
 
 function logLine(level, message, meta) {
-  const entry = {
-    ts: nowIso(),
-    level,
-    msg: message,
-    ...(meta ? { meta } : {})
-  };
+  const entry = { ts: nowIso(), level, msg: message, ...(meta ? { meta } : {}) };
   const line = JSON.stringify(entry) + "\n";
+
   try {
     fs.appendFileSync(logPath, line, "utf8");
   } catch (e) {
-    // If file logging fails, still try console
     console.error("LOG_WRITE_FAILED", e?.message || e);
   }
 
-  // Console mirror
   if (level === "error") console.error(entry);
   else if (level === "warn") console.warn(entry);
   else console.log(entry);
@@ -118,7 +142,7 @@ function generateKeypair() {
 
 function allocateIP() {
   const used = new Set(
-    db.prepare("SELECT ip FROM clients WHERE revoked=0").all().map(r => r.ip)
+    db.prepare("SELECT ip FROM clients WHERE revoked=0").all().map((r) => r.ip)
   );
 
   for (let i = 2; i <= 254; i++) {
@@ -129,7 +153,6 @@ function allocateIP() {
 }
 
 function wgAddPeer(publicKey, ip) {
-  // Adds peer live, no restart
   sh("wg", ["set", CONFIG.WG_IFACE, "peer", publicKey, "allowed-ips", `${ip}/32`]);
   log.info("wgAddPeer", { publicKey, ip, iface: CONFIG.WG_IFACE });
 }
@@ -140,7 +163,7 @@ function wgRemovePeer(publicKey) {
 }
 
 function buildClientConfig({ clientPrivateKey, clientIP }) {
-  // IMPORTANT: do not log clientPrivateKey anywhere
+  // IMPORTANT: never log clientPrivateKey
   return `[Interface]
 PrivateKey = ${clientPrivateKey}
 Address = ${clientIP}/24
@@ -155,7 +178,6 @@ PersistentKeepalive = 25
 `;
 }
 
-// Express wrapper for sync handlers
 function wrap(fn) {
   return (req, res, next) => {
     try {
@@ -164,6 +186,33 @@ function wrap(fn) {
       next(e);
     }
   };
+}
+
+/**
+ * =========================
+ * JWT AUTH
+ * =========================
+ */
+function signToken({ username }) {
+  return jwt.sign(
+    { sub: username, role: "admin" },
+    CONFIG.JWT.SECRET,
+    { expiresIn: CONFIG.JWT.EXPIRES_IN, issuer: CONFIG.JWT.ISSUER }
+  );
+}
+
+function authRequired(req, res, next) {
+  const h = req.headers.authorization || "";
+  if (!h.startsWith("Bearer ")) return res.status(401).json({ error: "missing_bearer_token" });
+
+  const token = h.slice(7).trim();
+  try {
+    const payload = jwt.verify(token, CONFIG.JWT.SECRET, { issuer: CONFIG.JWT.ISSUER });
+    req.user = payload; // { sub, role, iat, exp, iss }
+    return next();
+  } catch (e) {
+    return res.status(401).json({ error: "invalid_or_expired_token" });
+  }
 }
 
 /**
@@ -183,7 +232,6 @@ function syncDbPeersToWireGuard() {
     wgAddPeer(c.publicKey, c.ip); // idempotent
     applied++;
   }
-
   return applied;
 }
 
@@ -198,15 +246,16 @@ app.use(express.json());
 // Request logging middleware
 app.use((req, res, next) => {
   const start = Date.now();
-  const ip = req.headers["x-forwarded-for"]?.toString().split(",")[0]?.trim() || req.socket.remoteAddress;
+  const ip =
+    req.headers["x-forwarded-for"]?.toString().split(",")[0]?.trim() ||
+    req.socket.remoteAddress;
 
   res.on("finish", () => {
-    const ms = Date.now() - start;
     log.info("http", {
       method: req.method,
       path: req.originalUrl,
       status: res.statusCode,
-      ms,
+      ms: Date.now() - start,
       ip
     });
   });
@@ -214,14 +263,64 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get("/health", wrap((_req, res) => {
-  res.json({
-    ok: true,
-    iface: CONFIG.WG_IFACE,
-    endpoint: CONFIG.SERVER_ENDPOINT
-  });
+/**
+ * Helper endpoint: generate bcrypt hash for a password
+ * (Remove this route after you set CONFIG.ADMIN.PASSWORD_BCRYPT)
+ *
+ * POST /setup/hash
+ * Body: { "password": "mynewpassword" }
+ */
+app.post("/setup/hash", wrap((req, res) => {
+  const password = (req.body?.password || "").toString();
+  if (!password || password.length < 10) {
+    return res.status(400).json({ error: "password must be at least 10 chars" });
+  }
+  const hash = bcrypt.hashSync(password, 10);
+  res.json({ bcrypt: hash });
 }));
 
+/**
+ * Login: username + password -> JWT
+ *
+ * POST /auth 
+ * Body: { "username": "...", "password": "..." }
+ * Response: { "token": "...", "expiresIn": "12h", "tokenType": "Bearer" }
+ */
+app.post("/auth/login", wrap((req, res) => {
+  const username = (req.body?.username || "").toString();
+  const password = (req.body?.password || "").toString();
+
+  // avoid leaking whether username exists
+  const userOk = username === CONFIG.ADMIN.USERNAME;
+  const passOk = userOk && bcrypt.compareSync(password, CONFIG.ADMIN.PASSWORD_BCRYPT);
+
+  if (!passOk) {
+    log.warn("login_failed", { username });
+    return res.status(401).json({ error: "invalid_credentials" });
+  }
+
+  const token = signToken({ username });
+  log.info("login_success", { username });
+
+  res.json({ tokenType: "Bearer", token, expiresIn: CONFIG.JWT.EXPIRES_IN });
+}));
+
+/**
+ * Public health (no auth)
+ */
+app.get("/health", wrap((_req, res) => {
+  res.json({ ok: true, iface: CONFIG.WG_IFACE, endpoint: CONFIG.SERVER_ENDPOINT });
+}));
+
+/**
+ * Everything below requires JWT
+ */
+app.use(authRequired);
+
+/**
+ * POST /clients
+ * Body: { "name": "phone" }
+ */
 app.post("/clients", wrap((req, res) => {
   const name = (req.body?.name || "client").toString();
   const id = nanoid(10);
@@ -235,7 +334,7 @@ app.post("/clients", wrap((req, res) => {
     VALUES (?, ?, ?, ?, ?, ?, 0)
   `).run(id, name, publicKey, privateKey, ip, new Date().toISOString());
 
-  log.info("clientCreated_serverKeys", { id, name, ip, publicKey });
+  log.info("clientCreated_serverKeys", { id, name, ip, publicKey, by: req.user?.sub });
 
   res.json({
     id,
@@ -246,12 +345,16 @@ app.post("/clients", wrap((req, res) => {
   });
 }));
 
+/**
+ * POST /clients/by-public-key
+ * Body: { "name": "laptop", "publicKey": "..." }
+ */
 app.post("/clients/by-public-key", wrap((req, res) => {
   const name = (req.body?.name || "client").toString();
   const publicKey = (req.body?.publicKey || "").toString().trim();
 
   if (!isLikelyWGKey(publicKey)) {
-    log.warn("clientCreate_invalidPublicKey", { name, publicKey });
+    log.warn("clientCreate_invalidPublicKey", { name, publicKey, by: req.user?.sub });
     return res.status(400).json({ error: "publicKey is invalid" });
   }
 
@@ -265,11 +368,14 @@ app.post("/clients/by-public-key", wrap((req, res) => {
     VALUES (?, ?, ?, NULL, ?, ?, 0)
   `).run(id, name, publicKey, ip, new Date().toISOString());
 
-  log.info("clientCreated_publicKeyOnly", { id, name, ip, publicKey });
+  log.info("clientCreated_publicKeyOnly", { id, name, ip, publicKey, by: req.user?.sub });
 
   res.json({ id, name, ip, publicKey });
 }));
 
+/**
+ * GET /clients
+ */
 app.get("/clients", wrap((_req, res) => {
   const rows = db.prepare(`
     SELECT id, name, public_key as publicKey, ip, created_at as createdAt, revoked
@@ -279,6 +385,9 @@ app.get("/clients", wrap((_req, res) => {
   res.json(rows);
 }));
 
+/**
+ * DELETE /clients/:id
+ */
 app.delete("/clients/:id", wrap((req, res) => {
   const id = req.params.id;
   const row = db.prepare(`
@@ -288,26 +397,28 @@ app.delete("/clients/:id", wrap((req, res) => {
   `).get(id);
 
   if (!row) {
-    log.warn("clientRevoke_notFound", { id });
+    log.warn("clientRevoke_notFound", { id, by: req.user?.sub });
     return res.status(404).json({ error: "not found" });
   }
 
   if (row.revoked) {
-    log.info("clientRevoke_alreadyRevoked", { id, publicKey: row.publicKey });
+    log.info("clientRevoke_alreadyRevoked", { id, publicKey: row.publicKey, by: req.user?.sub });
     return res.json({ ok: true, alreadyRevoked: true });
   }
 
   wgRemovePeer(row.publicKey);
   db.prepare(`UPDATE clients SET revoked=1 WHERE id=?`).run(id);
 
-  log.info("clientRevoked", { id, publicKey: row.publicKey });
-
+  log.info("clientRevoked", { id, publicKey: row.publicKey, by: req.user?.sub });
   res.json({ ok: true });
 }));
 
-app.post("/sync", wrap((_req, res) => {
+/**
+ * POST /sync
+ */
+app.post("/sync", wrap((req, res) => {
   const count = syncDbPeersToWireGuard();
-  log.info("syncTriggered", { appliedPeers: count });
+  log.info("syncTriggered", { appliedPeers: count, by: req.user?.sub });
   res.json({ ok: true, appliedPeers: count });
 }));
 
@@ -334,19 +445,20 @@ try {
   log.info("startupSyncComplete", { appliedPeers: count, iface: CONFIG.WG_IFACE });
 } catch (e) {
   log.error("startupSyncFailed", { message: e?.message, stack: e?.stack });
-  // don’t exit; API can still start
 }
 
 app.listen(CONFIG.API_PORT, () => {
   log.info("serverStarted", { port: CONFIG.API_PORT });
   log.info("endpoints", {
     endpoints: [
+      "POST /setup/hash (TEMP)",
+      "POST /auth/login",
       "GET /health",
-      "POST /clients",
-      "POST /clients/by-public-key",
-      "GET /clients",
-      "DELETE /clients/:id",
-      "POST /sync"
+      "POST /clients (JWT)",
+      "POST /clients/by-public-key (JWT)",
+      "GET /clients (JWT)",
+      "DELETE /clients/:id (JWT)",
+      "POST /sync (JWT)"
     ]
   });
 });
