@@ -1,8 +1,16 @@
 /**
- * wg-control (ESM)
- * Auth: JWT + bcrypt
- * Public:  /auth/login, /health
- * Protected resources: /clients*, /sync
+ * wg-control (ESM) — JWT-protected resources (bulletproof middleware order)
+ *
+ * Public:
+ *   POST /auth/login
+ *   GET  /health
+ *
+ * Protected (MUST include Authorization: Bearer <token>):
+ *   POST   /clients
+ *   POST   /clients/by-public-key
+ *   GET    /clients
+ *   DELETE /clients/:id
+ *   POST   /sync
  *
  * Install:
  *   npm i express better-sqlite3 nanoid jsonwebtoken bcryptjs
@@ -30,12 +38,11 @@ const CONFIG = {
   SERVER_ENDPOINT: "51.222.139.224:51820",
   SERVER_PUBLIC_KEY: "PUT_SERVER_PUBLIC_KEY_HERE",
   DNS: "1.1.1.1, 8.8.8.8",
-  VPN_IP_PREFIX: "10.0.0.", // 10.0.0.2 .. 10.0.0.254
+  VPN_IP_PREFIX: "10.0.0.",
   CLIENT_MTU: 1420,
   API_PORT: 9191,
 
   JWT: {
-    // CHANGE THIS
     SECRET: "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET",
     EXPIRES_IN: "12h",
     ISSUER: "wg-control"
@@ -72,7 +79,6 @@ function log(level, msg, meta) {
   } catch (e) {
     console.error("LOG_WRITE_FAILED", e?.message || e);
   }
-
   if (level === "error") console.error(entry);
   else if (level === "warn") console.warn(entry);
   else console.log(entry);
@@ -82,7 +88,6 @@ process.on("uncaughtException", (e) => {
   log("error", "uncaughtException", { message: e?.message, stack: e?.stack });
   process.exit(1);
 });
-
 process.on("unhandledRejection", (e) => {
   log("error", "unhandledRejection", { message: e?.message, stack: e?.stack });
   process.exit(1);
@@ -100,7 +105,7 @@ CREATE TABLE IF NOT EXISTS clients (
   id TEXT PRIMARY KEY,
   name TEXT,
   public_key TEXT UNIQUE NOT NULL,
-  private_key TEXT,        -- only present for /clients (server-generated)
+  private_key TEXT,
   ip TEXT UNIQUE NOT NULL,
   created_at TEXT NOT NULL,
   revoked INTEGER NOT NULL DEFAULT 0
@@ -163,9 +168,9 @@ PersistentKeepalive = 25
 }
 
 function syncDbPeersToWireGuard() {
-  const peers = db.prepare(
-    "SELECT public_key, ip FROM clients WHERE revoked=0"
-  ).all();
+  const peers = db
+    .prepare("SELECT public_key, ip FROM clients WHERE revoked=0")
+    .all();
   for (const p of peers) {
     wgAddPeer(p.public_key, p.ip); // idempotent
   }
@@ -190,10 +195,10 @@ function authRequired(req, res, next) {
   if (!h.startsWith("Bearer ")) {
     return res.status(401).json({ error: "missing_token" });
   }
+
+  const token = h.slice(7).trim();
   try {
-    req.user = jwt.verify(h.slice(7).trim(), CONFIG.JWT.SECRET, {
-      issuer: CONFIG.JWT.ISSUER
-    });
+    req.user = jwt.verify(token, CONFIG.JWT.SECRET, { issuer: CONFIG.JWT.ISSUER });
     return next();
   } catch {
     return res.status(401).json({ error: "invalid_or_expired_token" });
@@ -208,7 +213,7 @@ function authRequired(req, res, next) {
 const app = express();
 app.use(express.json());
 
-// Request logging
+// Request log (safe)
 app.use((req, res, next) => {
   const start = Date.now();
   const ip =
@@ -229,11 +234,15 @@ app.use((req, res, next) => {
 });
 
 /**
- * PUBLIC
+ * =========================
+ * PUBLIC ROUTER
+ * =========================
  */
-app.get("/health", (_req, res) => res.json({ ok: true }));
+const publicRouter = express.Router();
 
-app.post("/auth/login", (req, res) => {
+publicRouter.get("/health", (_req, res) => res.json({ ok: true }));
+
+publicRouter.post("/auth/login", (req, res) => {
   const username = (req.body?.username || "").toString();
   const password = (req.body?.password || "").toString();
 
@@ -249,27 +258,25 @@ app.post("/auth/login", (req, res) => {
   const token = signToken(username);
   log("info", "login_success", { username });
 
-  res.json({ tokenType: "Bearer", token, expiresIn: CONFIG.JWT.EXPIRES_IN });
+  return res.json({
+    tokenType: "Bearer",
+    token,
+    expiresIn: CONFIG.JWT.EXPIRES_IN
+  });
 });
 
-/**
- * PROTECTED RESOURCES (everything below)
- */
-app.use(authRequired);
+app.use(publicRouter);
 
 /**
- * Protected health (optional)
- * You can remove this if you only want public /health.
+ * =========================
+ * PROTECTED ROUTER (resources)
+ * =========================
+ * Everything in this router is protected, always.
  */
-app.get("/health/protected", (req, res) => {
-  res.json({ ok: true, user: req.user?.sub });
-});
+const protectedRouter = express.Router();
+protectedRouter.use(authRequired);
 
-/**
- * POST /clients
- * Body: { "name": "phone" }
- */
-app.post("/clients", (req, res) => {
+protectedRouter.post("/clients", (req, res) => {
   const name = (req.body?.name || "client").toString();
   const id = nanoid(10);
   const ip = allocateIP();
@@ -293,17 +300,13 @@ app.post("/clients", (req, res) => {
   });
 });
 
-/**
- * POST /clients/by-public-key
- * Body: { "name": "laptop", "publicKey": "..." }
- */
-app.post("/clients/by-public-key", (req, res) => {
+protectedRouter.post("/clients/by-public-key", (req, res) => {
   const name = (req.body?.name || "client").toString();
   const publicKey = (req.body?.publicKey || "").toString().trim();
 
   if (!isLikelyWGKey(publicKey)) {
     log("warn", "clientCreate_invalidPublicKey", { name, publicKey, by: req.user?.sub });
-    return res.status(400).json({ error: "publicKey is invalid" });
+    return res.status(400).json({ error: "invalid_public_key" });
   }
 
   const id = nanoid(10);
@@ -321,10 +324,7 @@ app.post("/clients/by-public-key", (req, res) => {
   res.json({ id, name, ip, publicKey });
 });
 
-/**
- * GET /clients
- */
-app.get("/clients", (_req, res) => {
+protectedRouter.get("/clients", (_req, res) => {
   const rows = db.prepare(`
     SELECT id, name, public_key AS publicKey, ip, created_at AS createdAt, revoked
     FROM clients
@@ -333,10 +333,7 @@ app.get("/clients", (_req, res) => {
   res.json(rows);
 });
 
-/**
- * DELETE /clients/:id
- */
-app.delete("/clients/:id", (req, res) => {
+protectedRouter.delete("/clients/:id", (req, res) => {
   const id = req.params.id;
   const row = db.prepare("SELECT public_key, revoked FROM clients WHERE id=?").get(id);
 
@@ -357,18 +354,24 @@ app.delete("/clients/:id", (req, res) => {
   res.json({ ok: true });
 });
 
-/**
- * POST /sync
- */
-app.post("/sync", (req, res) => {
+protectedRouter.post("/sync", (req, res) => {
   const count = syncDbPeersToWireGuard();
   log("info", "syncTriggered", { appliedPeers: count, by: req.user?.sub });
   res.json({ ok: true, appliedPeers: count });
 });
 
+// mount protected routes
+app.use(protectedRouter);
+
 /**
- * Error handler
+ * =========================
+ * 404 + ERROR HANDLER
+ * =========================
  */
+app.use((req, res) => {
+  res.status(404).json({ error: "not_found" });
+});
+
 app.use((err, req, res, _next) => {
   log("error", "expressError", {
     message: err?.message || "unknown",
@@ -380,7 +383,9 @@ app.use((err, req, res, _next) => {
 });
 
 /**
+ * =========================
  * BOOT
+ * =========================
  */
 try {
   const applied = syncDbPeersToWireGuard();
@@ -390,11 +395,10 @@ try {
 }
 
 app.listen(CONFIG.API_PORT, () => {
-  log("info", "server_started", { port: CONFIG.API_PORT });
-  log("info", "routes", {
+  log("info", "server_started", {
+    port: CONFIG.API_PORT,
     public: ["GET /health", "POST /auth/login"],
     protected: [
-      "GET /health/protected",
       "POST /clients",
       "POST /clients/by-public-key",
       "GET /clients",
