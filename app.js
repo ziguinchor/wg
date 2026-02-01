@@ -1,3 +1,16 @@
+/**
+ * wg-control (ESM)
+ * Auth: JWT + bcrypt
+ * Public:  /auth/login, /health
+ * Protected resources: /clients*, /sync
+ *
+ * Install:
+ *   npm i express better-sqlite3 nanoid jsonwebtoken bcryptjs
+ *
+ * Run (needs root for `wg set`):
+ *   sudo node app.js
+ */
+
 import express from "express";
 import Database from "better-sqlite3";
 import { nanoid } from "nanoid";
@@ -17,11 +30,12 @@ const CONFIG = {
   SERVER_ENDPOINT: "51.222.139.224:51820",
   SERVER_PUBLIC_KEY: "PUT_SERVER_PUBLIC_KEY_HERE",
   DNS: "1.1.1.1, 8.8.8.8",
-  VPN_IP_PREFIX: "10.0.0.",
+  VPN_IP_PREFIX: "10.0.0.", // 10.0.0.2 .. 10.0.0.254
   CLIENT_MTU: 1420,
   API_PORT: 9191,
 
   JWT: {
+    // CHANGE THIS
     SECRET: "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET",
     EXPIRES_IN: "12h",
     ISSUER: "wg-control"
@@ -39,7 +53,7 @@ const CONFIG = {
 
 /**
  * =========================
- * LOGGER
+ * LOGGER (file + console)
  * =========================
  */
 const logDir = path.resolve(CONFIG.LOG_DIR);
@@ -53,17 +67,23 @@ function log(level, msg, meta) {
     msg,
     ...(meta ? { meta } : {})
   };
-  fs.appendFileSync(logPath, JSON.stringify(entry) + "\n");
+  try {
+    fs.appendFileSync(logPath, JSON.stringify(entry) + "\n", "utf8");
+  } catch (e) {
+    console.error("LOG_WRITE_FAILED", e?.message || e);
+  }
+
   if (level === "error") console.error(entry);
+  else if (level === "warn") console.warn(entry);
   else console.log(entry);
 }
 
-process.on("uncaughtException", e => {
-  log("error", "uncaughtException", { message: e.message, stack: e.stack });
+process.on("uncaughtException", (e) => {
+  log("error", "uncaughtException", { message: e?.message, stack: e?.stack });
   process.exit(1);
 });
 
-process.on("unhandledRejection", e => {
+process.on("unhandledRejection", (e) => {
   log("error", "unhandledRejection", { message: e?.message, stack: e?.stack });
   process.exit(1);
 });
@@ -80,7 +100,7 @@ CREATE TABLE IF NOT EXISTS clients (
   id TEXT PRIMARY KEY,
   name TEXT,
   public_key TEXT UNIQUE NOT NULL,
-  private_key TEXT,
+  private_key TEXT,        -- only present for /clients (server-generated)
   ip TEXT UNIQUE NOT NULL,
   created_at TEXT NOT NULL,
   revoked INTEGER NOT NULL DEFAULT 0
@@ -97,7 +117,7 @@ function sh(cmd, args, opts = {}) {
 }
 
 function isLikelyWGKey(k) {
-  return /^[A-Za-z0-9+/]{42}=$/.test(k);
+  return typeof k === "string" && /^[A-Za-z0-9+/]{42}=$/.test(k.trim());
 }
 
 function generateKeypair() {
@@ -108,7 +128,7 @@ function generateKeypair() {
 
 function allocateIP() {
   const used = new Set(
-    db.prepare("SELECT ip FROM clients WHERE revoked=0").all().map(r => r.ip)
+    db.prepare("SELECT ip FROM clients WHERE revoked=0").all().map((r) => r.ip)
   );
   for (let i = 2; i <= 254; i++) {
     const ip = `${CONFIG.VPN_IP_PREFIX}${i}`;
@@ -119,10 +139,12 @@ function allocateIP() {
 
 function wgAddPeer(publicKey, ip) {
   sh("wg", ["set", CONFIG.WG_IFACE, "peer", publicKey, "allowed-ips", `${ip}/32`]);
+  log("info", "wgAddPeer", { publicKey, ip, iface: CONFIG.WG_IFACE });
 }
 
 function wgRemovePeer(publicKey) {
   sh("wg", ["set", CONFIG.WG_IFACE, "peer", publicKey, "remove"]);
+  log("info", "wgRemovePeer", { publicKey, iface: CONFIG.WG_IFACE });
 }
 
 function buildClientConfig(priv, ip) {
@@ -138,6 +160,16 @@ Endpoint = ${CONFIG.SERVER_ENDPOINT}
 AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 `;
+}
+
+function syncDbPeersToWireGuard() {
+  const peers = db.prepare(
+    "SELECT public_key, ip FROM clients WHERE revoked=0"
+  ).all();
+  for (const p of peers) {
+    wgAddPeer(p.public_key, p.ip); // idempotent
+  }
+  return peers.length;
 }
 
 /**
@@ -159,12 +191,12 @@ function authRequired(req, res, next) {
     return res.status(401).json({ error: "missing_token" });
   }
   try {
-    req.user = jwt.verify(h.slice(7), CONFIG.JWT.SECRET, {
+    req.user = jwt.verify(h.slice(7).trim(), CONFIG.JWT.SECRET, {
       issuer: CONFIG.JWT.ISSUER
     });
-    next();
+    return next();
   } catch {
-    res.status(401).json({ error: "invalid_token" });
+    return res.status(401).json({ error: "invalid_or_expired_token" });
   }
 }
 
@@ -176,30 +208,40 @@ function authRequired(req, res, next) {
 const app = express();
 app.use(express.json());
 
-// request log
+// Request logging
 app.use((req, res, next) => {
   const start = Date.now();
+  const ip =
+    req.headers["x-forwarded-for"]?.toString().split(",")[0]?.trim() ||
+    req.socket.remoteAddress;
+
   res.on("finish", () => {
     log("info", "http", {
       method: req.method,
       path: req.originalUrl,
       status: res.statusCode,
-      ms: Date.now() - start
+      ms: Date.now() - start,
+      ip
     });
   });
+
   next();
 });
 
 /**
- * LOGIN (PUBLIC)
+ * PUBLIC
  */
-app.post("/auth/login", (req, res) => {
-  const { username, password } = req.body || {};
+app.get("/health", (_req, res) => res.json({ ok: true }));
 
-  if (
-    username !== CONFIG.ADMIN.USERNAME ||
-    !bcrypt.compareSync(password || "", CONFIG.ADMIN.PASSWORD_BCRYPT)
-  ) {
+app.post("/auth/login", (req, res) => {
+  const username = (req.body?.username || "").toString();
+  const password = (req.body?.password || "").toString();
+
+  const ok =
+    username === CONFIG.ADMIN.USERNAME &&
+    bcrypt.compareSync(password, CONFIG.ADMIN.PASSWORD_BCRYPT);
+
+  if (!ok) {
     log("warn", "login_failed", { username });
     return res.status(401).json({ error: "invalid_credentials" });
   }
@@ -207,30 +249,28 @@ app.post("/auth/login", (req, res) => {
   const token = signToken(username);
   log("info", "login_success", { username });
 
-  res.json({
-    tokenType: "Bearer",
-    token,
-    expiresIn: CONFIG.JWT.EXPIRES_IN
-  });
+  res.json({ tokenType: "Bearer", token, expiresIn: CONFIG.JWT.EXPIRES_IN });
 });
 
 /**
- * EVERYTHING BELOW IS PROTECTED
+ * PROTECTED RESOURCES (everything below)
  */
 app.use(authRequired);
 
 /**
- * HEALTH
+ * Protected health (optional)
+ * You can remove this if you only want public /health.
  */
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, iface: CONFIG.WG_IFACE });
+app.get("/health/protected", (req, res) => {
+  res.json({ ok: true, user: req.user?.sub });
 });
 
 /**
- * CREATE CLIENT
+ * POST /clients
+ * Body: { "name": "phone" }
  */
-app.post("/clients", (_req, res) => {
-  const name = _req.body?.name || "client";
+app.post("/clients", (req, res) => {
+  const name = (req.body?.name || "client").toString();
   const id = nanoid(10);
   const ip = allocateIP();
   const { privateKey, publicKey } = generateKeypair();
@@ -238,8 +278,11 @@ app.post("/clients", (_req, res) => {
   wgAddPeer(publicKey, ip);
 
   db.prepare(`
-    INSERT INTO clients VALUES (?, ?, ?, ?, ?, ?, 0)
+    INSERT INTO clients (id, name, public_key, private_key, ip, created_at, revoked)
+    VALUES (?, ?, ?, ?, ?, ?, 0)
   `).run(id, name, publicKey, privateKey, ip, new Date().toISOString());
+
+  log("info", "clientCreated_serverKeys", { id, name, ip, publicKey, by: req.user?.sub });
 
   res.json({
     id,
@@ -251,12 +294,16 @@ app.post("/clients", (_req, res) => {
 });
 
 /**
- * CREATE CLIENT (PUBLIC KEY ONLY)
+ * POST /clients/by-public-key
+ * Body: { "name": "laptop", "publicKey": "..." }
  */
 app.post("/clients/by-public-key", (req, res) => {
-  const { name = "client", publicKey } = req.body || {};
+  const name = (req.body?.name || "client").toString();
+  const publicKey = (req.body?.publicKey || "").toString().trim();
+
   if (!isLikelyWGKey(publicKey)) {
-    return res.status(400).json({ error: "invalid_public_key" });
+    log("warn", "clientCreate_invalidPublicKey", { name, publicKey, by: req.user?.sub });
+    return res.status(400).json({ error: "publicKey is invalid" });
   }
 
   const id = nanoid(10);
@@ -265,55 +312,94 @@ app.post("/clients/by-public-key", (req, res) => {
   wgAddPeer(publicKey, ip);
 
   db.prepare(`
-    INSERT INTO clients VALUES (?, ?, ?, NULL, ?, ?, 0)
+    INSERT INTO clients (id, name, public_key, private_key, ip, created_at, revoked)
+    VALUES (?, ?, ?, NULL, ?, ?, 0)
   `).run(id, name, publicKey, ip, new Date().toISOString());
+
+  log("info", "clientCreated_publicKeyOnly", { id, name, ip, publicKey, by: req.user?.sub });
 
   res.json({ id, name, ip, publicKey });
 });
 
 /**
- * LIST CLIENTS
+ * GET /clients
  */
 app.get("/clients", (_req, res) => {
-  res.json(
-    db.prepare(`
-      SELECT id, name, public_key AS publicKey, ip, created_at AS createdAt, revoked
-      FROM clients
-    `).all()
-  );
+  const rows = db.prepare(`
+    SELECT id, name, public_key AS publicKey, ip, created_at AS createdAt, revoked
+    FROM clients
+    ORDER BY created_at DESC
+  `).all();
+  res.json(rows);
 });
 
 /**
- * REVOKE CLIENT
+ * DELETE /clients/:id
  */
 app.delete("/clients/:id", (req, res) => {
-  const row = db.prepare(
-    "SELECT public_key, revoked FROM clients WHERE id=?"
-  ).get(req.params.id);
+  const id = req.params.id;
+  const row = db.prepare("SELECT public_key, revoked FROM clients WHERE id=?").get(id);
 
-  if (!row) return res.status(404).json({ error: "not_found" });
-  if (row.revoked) return res.json({ ok: true });
+  if (!row) {
+    log("warn", "clientRevoke_notFound", { id, by: req.user?.sub });
+    return res.status(404).json({ error: "not_found" });
+  }
+
+  if (row.revoked) {
+    log("info", "clientRevoke_alreadyRevoked", { id, by: req.user?.sub });
+    return res.json({ ok: true, alreadyRevoked: true });
+  }
 
   wgRemovePeer(row.public_key);
-  db.prepare("UPDATE clients SET revoked=1 WHERE id=?").run(req.params.id);
+  db.prepare("UPDATE clients SET revoked=1 WHERE id=?").run(id);
 
+  log("info", "clientRevoked", { id, publicKey: row.public_key, by: req.user?.sub });
   res.json({ ok: true });
 });
 
 /**
- * SYNC
+ * POST /sync
  */
-app.post("/sync", (_req, res) => {
-  const peers = db.prepare(
-    "SELECT public_key, ip FROM clients WHERE revoked=0"
-  ).all();
-  peers.forEach(p => wgAddPeer(p.public_key, p.ip));
-  res.json({ ok: true, appliedPeers: peers.length });
+app.post("/sync", (req, res) => {
+  const count = syncDbPeersToWireGuard();
+  log("info", "syncTriggered", { appliedPeers: count, by: req.user?.sub });
+  res.json({ ok: true, appliedPeers: count });
 });
 
 /**
- * START
+ * Error handler
  */
+app.use((err, req, res, _next) => {
+  log("error", "expressError", {
+    message: err?.message || "unknown",
+    stack: err?.stack,
+    path: req?.originalUrl,
+    method: req?.method
+  });
+  res.status(500).json({ error: "internal_error" });
+});
+
+/**
+ * BOOT
+ */
+try {
+  const applied = syncDbPeersToWireGuard();
+  log("info", "startupSyncComplete", { appliedPeers: applied, iface: CONFIG.WG_IFACE });
+} catch (e) {
+  log("error", "startupSyncFailed", { message: e?.message, stack: e?.stack });
+}
+
 app.listen(CONFIG.API_PORT, () => {
   log("info", "server_started", { port: CONFIG.API_PORT });
+  log("info", "routes", {
+    public: ["GET /health", "POST /auth/login"],
+    protected: [
+      "GET /health/protected",
+      "POST /clients",
+      "POST /clients/by-public-key",
+      "GET /clients",
+      "DELETE /clients/:id",
+      "POST /sync"
+    ]
+  });
 });
