@@ -1,16 +1,16 @@
 /**
- * wg-control (ESM) — JWT-protected resources (bulletproof middleware order)
+ * wg-control (ESM) — JWT enforced on ALL resource endpoints
  *
  * Public:
  *   POST /auth/login
  *   GET  /health
  *
- * Protected (MUST include Authorization: Bearer <token>):
- *   POST   /clients
- *   POST   /clients/by-public-key
- *   GET    /clients
- *   DELETE /clients/:id
- *   POST   /sync
+ * Protected (must include Authorization: Bearer <token>):
+ *   POST   /api/clients
+ *   POST   /api/clients/by-public-key
+ *   GET    /api/clients
+ *   DELETE /api/clients/:id
+ *   POST   /api/sync
  *
  * Install:
  *   npm i express better-sqlite3 nanoid jsonwebtoken bcryptjs
@@ -28,11 +28,9 @@ import path from "path";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 
-/**
- * =========================
- * CONFIG (EDIT THESE ONLY)
- * =========================
- */
+/** =========================
+ * CONFIG
+ * ========================= */
 const CONFIG = {
   WG_IFACE: "wg0",
   SERVER_ENDPOINT: "51.222.139.224:51820",
@@ -58,22 +56,15 @@ const CONFIG = {
   LOG_FILE: "wg-control.log"
 };
 
-/**
- * =========================
+/** =========================
  * LOGGER (file + console)
- * =========================
- */
+ * ========================= */
 const logDir = path.resolve(CONFIG.LOG_DIR);
 fs.mkdirSync(logDir, { recursive: true });
 const logPath = path.join(logDir, CONFIG.LOG_FILE);
 
 function log(level, msg, meta) {
-  const entry = {
-    ts: new Date().toISOString(),
-    level,
-    msg,
-    ...(meta ? { meta } : {})
-  };
+  const entry = { ts: new Date().toISOString(), level, msg, ...(meta ? { meta } : {}) };
   try {
     fs.appendFileSync(logPath, JSON.stringify(entry) + "\n", "utf8");
   } catch (e) {
@@ -93,11 +84,9 @@ process.on("unhandledRejection", (e) => {
   process.exit(1);
 });
 
-/**
- * =========================
+/** =========================
  * DB
- * =========================
- */
+ * ========================= */
 const db = new Database("wg.db");
 db.pragma("journal_mode = WAL");
 db.exec(`
@@ -112,11 +101,9 @@ CREATE TABLE IF NOT EXISTS clients (
 );
 `);
 
-/**
- * =========================
+/** =========================
  * HELPERS
- * =========================
- */
+ * ========================= */
 function sh(cmd, args, opts = {}) {
   return execFileSync(cmd, args, { encoding: "utf8", ...opts }).trim();
 }
@@ -168,20 +155,14 @@ PersistentKeepalive = 25
 }
 
 function syncDbPeersToWireGuard() {
-  const peers = db
-    .prepare("SELECT public_key, ip FROM clients WHERE revoked=0")
-    .all();
-  for (const p of peers) {
-    wgAddPeer(p.public_key, p.ip); // idempotent
-  }
+  const peers = db.prepare("SELECT public_key, ip FROM clients WHERE revoked=0").all();
+  for (const p of peers) wgAddPeer(p.public_key, p.ip);
   return peers.length;
 }
 
-/**
- * =========================
- * AUTH
- * =========================
- */
+/** =========================
+ * AUTH (JWT)
+ * ========================= */
 function signToken(username) {
   return jwt.sign(
     { sub: username, role: "admin" },
@@ -191,6 +172,9 @@ function signToken(username) {
 }
 
 function authRequired(req, res, next) {
+  // Hard proof in logs that auth ran
+  log("info", "auth_middleware_hit", { path: req.originalUrl });
+
   const h = req.headers.authorization || "";
   if (!h.startsWith("Bearer ")) {
     return res.status(401).json({ error: "missing_token" });
@@ -205,44 +189,30 @@ function authRequired(req, res, next) {
   }
 }
 
-/**
- * =========================
+/** =========================
  * APP
- * =========================
- */
+ * ========================= */
 const app = express();
 app.use(express.json());
 
-// Request log (safe)
+// Request log
 app.use((req, res, next) => {
   const start = Date.now();
-  const ip =
-    req.headers["x-forwarded-for"]?.toString().split(",")[0]?.trim() ||
-    req.socket.remoteAddress;
-
   res.on("finish", () => {
     log("info", "http", {
       method: req.method,
       path: req.originalUrl,
       status: res.statusCode,
-      ms: Date.now() - start,
-      ip
+      ms: Date.now() - start
     });
   });
-
   next();
 });
 
-/**
- * =========================
- * PUBLIC ROUTER
- * =========================
- */
-const publicRouter = express.Router();
+/** ---------- PUBLIC ---------- */
+app.get("/health", (_req, res) => res.json({ ok: true }));
 
-publicRouter.get("/health", (_req, res) => res.json({ ok: true }));
-
-publicRouter.post("/auth/login", (req, res) => {
+app.post("/auth/login", (req, res) => {
   const username = (req.body?.username || "").toString();
   const password = (req.body?.password || "").toString();
 
@@ -258,25 +228,17 @@ publicRouter.post("/auth/login", (req, res) => {
   const token = signToken(username);
   log("info", "login_success", { username });
 
-  return res.json({
-    tokenType: "Bearer",
-    token,
-    expiresIn: CONFIG.JWT.EXPIRES_IN
-  });
+  return res.json({ tokenType: "Bearer", token, expiresIn: CONFIG.JWT.EXPIRES_IN });
 });
 
-app.use(publicRouter);
+/** ---------- PROTECTED RESOURCES (ONLY HERE) ---------- */
+const api = express.Router();
 
-/**
- * =========================
- * PROTECTED ROUTER (resources)
- * =========================
- * Everything in this router is protected, always.
- */
-const protectedRouter = express.Router();
-protectedRouter.use(authRequired);
+// Enforce JWT for everything under /api
+api.use(authRequired);
 
-protectedRouter.post("/clients", (req, res) => {
+// POST /api/clients
+api.post("/clients", (req, res) => {
   const name = (req.body?.name || "client").toString();
   const id = nanoid(10);
   const ip = allocateIP();
@@ -289,25 +251,14 @@ protectedRouter.post("/clients", (req, res) => {
     VALUES (?, ?, ?, ?, ?, ?, 0)
   `).run(id, name, publicKey, privateKey, ip, new Date().toISOString());
 
-  log("info", "clientCreated_serverKeys", { id, name, ip, publicKey, by: req.user?.sub });
-
-  res.json({
-    id,
-    name,
-    ip,
-    publicKey,
-    config: buildClientConfig(privateKey, ip)
-  });
+  res.json({ id, name, ip, publicKey, config: buildClientConfig(privateKey, ip) });
 });
 
-protectedRouter.post("/clients/by-public-key", (req, res) => {
+// POST /api/clients/by-public-key
+api.post("/clients/by-public-key", (req, res) => {
   const name = (req.body?.name || "client").toString();
   const publicKey = (req.body?.publicKey || "").toString().trim();
-
-  if (!isLikelyWGKey(publicKey)) {
-    log("warn", "clientCreate_invalidPublicKey", { name, publicKey, by: req.user?.sub });
-    return res.status(400).json({ error: "invalid_public_key" });
-  }
+  if (!isLikelyWGKey(publicKey)) return res.status(400).json({ error: "invalid_public_key" });
 
   const id = nanoid(10);
   const ip = allocateIP();
@@ -319,12 +270,11 @@ protectedRouter.post("/clients/by-public-key", (req, res) => {
     VALUES (?, ?, ?, NULL, ?, ?, 0)
   `).run(id, name, publicKey, ip, new Date().toISOString());
 
-  log("info", "clientCreated_publicKeyOnly", { id, name, ip, publicKey, by: req.user?.sub });
-
   res.json({ id, name, ip, publicKey });
 });
 
-protectedRouter.get("/clients", (_req, res) => {
+// GET /api/clients
+api.get("/clients", (_req, res) => {
   const rows = db.prepare(`
     SELECT id, name, public_key AS publicKey, ip, created_at AS createdAt, revoked
     FROM clients
@@ -333,44 +283,31 @@ protectedRouter.get("/clients", (_req, res) => {
   res.json(rows);
 });
 
-protectedRouter.delete("/clients/:id", (req, res) => {
+// DELETE /api/clients/:id
+api.delete("/clients/:id", (req, res) => {
   const id = req.params.id;
   const row = db.prepare("SELECT public_key, revoked FROM clients WHERE id=?").get(id);
 
-  if (!row) {
-    log("warn", "clientRevoke_notFound", { id, by: req.user?.sub });
-    return res.status(404).json({ error: "not_found" });
-  }
-
-  if (row.revoked) {
-    log("info", "clientRevoke_alreadyRevoked", { id, by: req.user?.sub });
-    return res.json({ ok: true, alreadyRevoked: true });
-  }
+  if (!row) return res.status(404).json({ error: "not_found" });
+  if (row.revoked) return res.json({ ok: true, alreadyRevoked: true });
 
   wgRemovePeer(row.public_key);
   db.prepare("UPDATE clients SET revoked=1 WHERE id=?").run(id);
 
-  log("info", "clientRevoked", { id, publicKey: row.public_key, by: req.user?.sub });
   res.json({ ok: true });
 });
 
-protectedRouter.post("/sync", (req, res) => {
+// POST /api/sync
+api.post("/sync", (_req, res) => {
   const count = syncDbPeersToWireGuard();
-  log("info", "syncTriggered", { appliedPeers: count, by: req.user?.sub });
   res.json({ ok: true, appliedPeers: count });
 });
 
-// mount protected routes
-app.use(protectedRouter);
+// Mount protected router
+app.use("/api", api);
 
-/**
- * =========================
- * 404 + ERROR HANDLER
- * =========================
- */
-app.use((req, res) => {
-  res.status(404).json({ error: "not_found" });
-});
+/** ---------- 404 + ERROR ---------- */
+app.use((_req, res) => res.status(404).json({ error: "not_found" }));
 
 app.use((err, req, res, _next) => {
   log("error", "expressError", {
@@ -382,14 +319,10 @@ app.use((err, req, res, _next) => {
   res.status(500).json({ error: "internal_error" });
 });
 
-/**
- * =========================
- * BOOT
- * =========================
- */
+/** ---------- BOOT ---------- */
 try {
   const applied = syncDbPeersToWireGuard();
-  log("info", "startupSyncComplete", { appliedPeers: applied, iface: CONFIG.WG_IFACE });
+  log("info", "startupSyncComplete", { appliedPeers: applied });
 } catch (e) {
   log("error", "startupSyncFailed", { message: e?.message, stack: e?.stack });
 }
@@ -399,11 +332,11 @@ app.listen(CONFIG.API_PORT, () => {
     port: CONFIG.API_PORT,
     public: ["GET /health", "POST /auth/login"],
     protected: [
-      "POST /clients",
-      "POST /clients/by-public-key",
-      "GET /clients",
-      "DELETE /clients/:id",
-      "POST /sync"
+      "POST /api/clients",
+      "POST /api/clients/by-public-key",
+      "GET /api/clients",
+      "DELETE /api/clients/:id",
+      "POST /api/sync"
     ]
   });
 });
