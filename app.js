@@ -1,5 +1,6 @@
 /**
- * wg-control (ESM) — JWT enforced on ALL resource endpoints
+ * wg-control (ESM) — JWT enforced on /api/* resources
+ * CORS explicitly DISABLED (rejects OPTIONS + no ACAO headers)
  *
  * Public:
  *   POST /auth/login
@@ -172,13 +173,8 @@ function signToken(username) {
 }
 
 function authRequired(req, res, next) {
-  // Hard proof in logs that auth ran
-  log("info", "auth_middleware_hit", { path: req.originalUrl });
-
   const h = req.headers.authorization || "";
-  if (!h.startsWith("Bearer ")) {
-    return res.status(401).json({ error: "missing_token" });
-  }
+  if (!h.startsWith("Bearer ")) return res.status(401).json({ error: "missing_token" });
 
   const token = h.slice(7).trim();
   try {
@@ -195,17 +191,33 @@ function authRequired(req, res, next) {
 const app = express();
 app.use(express.json());
 
+/**
+ * CORS explicitly DISABLED
+ * - no Access-Control-Allow-* headers are set
+ * - OPTIONS is rejected (preflight blocked)
+ */
+app.use((req, res, next) => {
+  if (req.method === "OPTIONS") return res.status(403).end();
+  return next();
+});
+
 // Request log
 app.use((req, res, next) => {
   const start = Date.now();
+  const ip =
+    req.headers["x-forwarded-for"]?.toString().split(",")[0]?.trim() ||
+    req.socket.remoteAddress;
+
   res.on("finish", () => {
     log("info", "http", {
       method: req.method,
       path: req.originalUrl,
       status: res.statusCode,
-      ms: Date.now() - start
+      ms: Date.now() - start,
+      ip
     });
   });
+
   next();
 });
 
@@ -231,10 +243,8 @@ app.post("/auth/login", (req, res) => {
   return res.json({ tokenType: "Bearer", token, expiresIn: CONFIG.JWT.EXPIRES_IN });
 });
 
-/** ---------- PROTECTED RESOURCES (ONLY HERE) ---------- */
+/** ---------- PROTECTED RESOURCES UNDER /api ---------- */
 const api = express.Router();
-
-// Enforce JWT for everything under /api
 api.use(authRequired);
 
 // POST /api/clients
@@ -303,7 +313,6 @@ api.post("/sync", (_req, res) => {
   res.json({ ok: true, appliedPeers: count });
 });
 
-// Mount protected router
 app.use("/api", api);
 
 /** ---------- 404 + ERROR ---------- */
@@ -337,6 +346,7 @@ app.listen(CONFIG.API_PORT, () => {
       "GET /api/clients",
       "DELETE /api/clients/:id",
       "POST /api/sync"
-    ]
+    ],
+    cors: "disabled"
   });
 });
