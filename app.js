@@ -30,11 +30,6 @@ import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 
 
-app.use(cors({
-  origin: "*",
-  methods: ["GET", "POST", "DELETE", "PUT", "PATCH", "OPTIONS"],
-  allowedHeaders: ["Authorization", "Content-Type"],
-}));
 
 
 
@@ -199,6 +194,14 @@ function authRequired(req, res, next) {
  * ========================= */
 const app = express();
 app.use(express.json());
+
+
+
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "DELETE", "PUT", "PATCH", "OPTIONS"],
+  allowedHeaders: ["Authorization", "Content-Type"],
+}));
 
 /**
  * CORS explicitly DISABLED
