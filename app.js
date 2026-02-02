@@ -1,19 +1,26 @@
 /**
- * wg-control (ESM)
- * - JWT + bcrypt auth
- * - Public:  GET /health, POST /auth/login
- * - Protected resources (JWT required): /api/*
- * - CORS: ALLOW ALL (any origin), allow Authorization header, allow OPTIONS
+ * wg-control (ESM) — JWT enforced on /api/* resources
+ * CORS explicitly DISABLED (rejects OPTIONS + no ACAO headers)
+ *
+ * Public:
+ *   POST /auth/login
+ *   GET  /health
+ *
+ * Protected (must include Authorization: Bearer <token>):
+ *   POST   /api/clients
+ *   POST   /api/clients/by-public-key
+ *   GET    /api/clients
+ *   DELETE /api/clients/:id
+ *   POST   /api/sync
  *
  * Install:
- *   npm i express better-sqlite3 nanoid jsonwebtoken bcryptjs cors
+ *   npm i express better-sqlite3 nanoid jsonwebtoken bcryptjs
  *
  * Run (needs root for `wg set`):
  *   sudo node app.js
  */
 
 import express from "express";
-import cors from "cors";
 import Database from "better-sqlite3";
 import { nanoid } from "nanoid";
 import { execFileSync } from "child_process";
@@ -21,6 +28,15 @@ import fs from "fs";
 import path from "path";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
+
+
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "DELETE", "PUT", "PATCH", "OPTIONS"],
+  allowedHeaders: ["Authorization", "Content-Type"],
+}));
+
+
 
 /** =========================
  * CONFIG
@@ -30,7 +46,7 @@ const CONFIG = {
   SERVER_ENDPOINT: "51.222.139.224:51820",
   SERVER_PUBLIC_KEY: "PUT_SERVER_PUBLIC_KEY_HERE",
   DNS: "1.1.1.1, 8.8.8.8",
-  VPN_IP_PREFIX: "10.0.0.", // 10.0.0.2 .. 10.0.0.254
+  VPN_IP_PREFIX: "10.0.0.",
   CLIENT_MTU: 1420,
   API_PORT: 9191,
 
@@ -88,7 +104,7 @@ CREATE TABLE IF NOT EXISTS clients (
   id TEXT PRIMARY KEY,
   name TEXT,
   public_key TEXT UNIQUE NOT NULL,
-  private_key TEXT,        -- only present for /api/clients (server-generated)
+  private_key TEXT,
   ip TEXT UNIQUE NOT NULL,
   created_at TEXT NOT NULL,
   revoked INTEGER NOT NULL DEFAULT 0
@@ -185,25 +201,16 @@ const app = express();
 app.use(express.json());
 
 /**
- * CORS: allow everything (browser clients)
- * - origin: *
- * - allow Authorization header (JWT)
- * - allow OPTIONS preflight
+ * CORS explicitly DISABLED
+ * - no Access-Control-Allow-* headers are set
+ * - OPTIONS is rejected (preflight blocked)
  */
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Authorization", "Content-Type"],
-    maxAge: 86400
-  })
-);
-// Make sure preflight gets a 204
-app.options("*", cors());
+app.use((req, res, next) => {
+  if (req.method === "OPTIONS") return res.status(403).end();
+  return next();
+});
 
-/**
- * Request logging
- */
+// Request log
 app.use((req, res, next) => {
   const start = Date.now();
   const ip =
@@ -219,6 +226,7 @@ app.use((req, res, next) => {
       ip
     });
   });
+
   next();
 });
 
@@ -340,7 +348,6 @@ try {
 app.listen(CONFIG.API_PORT, () => {
   log("info", "server_started", {
     port: CONFIG.API_PORT,
-    cors: "allow_all",
     public: ["GET /health", "POST /auth/login"],
     protected: [
       "POST /api/clients",
@@ -348,6 +355,7 @@ app.listen(CONFIG.API_PORT, () => {
       "GET /api/clients",
       "DELETE /api/clients/:id",
       "POST /api/sync"
-    ]
+    ],
+    cors: "disabled"
   });
 });
