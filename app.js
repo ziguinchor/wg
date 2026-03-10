@@ -28,6 +28,15 @@ import fs from "fs";
 import path from "path";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
+import cors from "cors";
+
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"]
+  })
+);
 
 import Admin from "./models/Admin.js";
 
@@ -234,15 +243,6 @@ function authRequired(req, res, next) {
 const app = express();
 app.use(express.json());
 
-/**
- * CORS explicitly disabled
- */
-app.use((req, res, next) => {
-  if (req.method === "OPTIONS") {
-    return res.status(403).json({ error: "cors_preflight_blocked" });
-  }
-  return next();
-});
 
 // Request log
 app.use((req, res, next) => {
