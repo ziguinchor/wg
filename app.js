@@ -1,12 +1,12 @@
 /**
  * wg-control (ESM) — JWT enforced on /api/* resources
- * CORS explicitly DISABLED (rejects OPTIONS + no ACAO headers)
+ * CORS disabled
  *
  * Public:
  *   POST /auth/login
  *   GET  /health
  *
- * Protected (must include Authorization: Bearer <token>):
+ * Protected:
  *   POST   /api/clients
  *   POST   /api/clients/by-public-key
  *   GET    /api/clients
@@ -14,24 +14,22 @@
  *   POST   /api/sync
  *
  * Install:
- *   npm i express better-sqlite3 nanoid jsonwebtoken bcryptjs
+ *   npm i express mongoose nanoid jsonwebtoken bcryptjs
  *
- * Run (needs root for `wg set`):
+ * Run:
  *   sudo node app.js
  */
 
 import express from "express";
-import Database from "better-sqlite3";
+import mongoose from "mongoose";
 import { nanoid } from "nanoid";
 import { execFileSync } from "child_process";
 import fs from "fs";
 import path from "path";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
-import cors from "cors"
 
-
-
+import Admin from "./models/Admin.js";
 
 /** =========================
  * CONFIG
@@ -45,15 +43,20 @@ const CONFIG = {
   CLIENT_MTU: 1420,
   API_PORT: 9191,
 
+  MONGODB_URI:
+    process.env.MONGODB_URI ||
+    "mongodb+srv://comaritc_db_user:lrBaDpBvhiAvlL88@wireguard-users.2g5q5fz.mongodb.net/wg_control?retryWrites=true&w=majority&appName=wireguard-users",
+
   JWT: {
-    SECRET: "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET",
+    SECRET: process.env.JWT_SECRET || "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET",
     EXPIRES_IN: "12h",
     ISSUER: "wg-control"
   },
 
   ADMIN: {
-    USERNAME: "admin",
+    USERNAME: process.env.ADMIN_USERNAME || "admin",
     PASSWORD_BCRYPT:
+      process.env.ADMIN_PASSWORD_BCRYPT ||
       "$2b$10$.jnMPA/bYTRADKpmcCqn1.tClAsF946OLdfwLPselAlmsdKhW6Ov6"
   },
 
@@ -75,6 +78,7 @@ function log(level, msg, meta) {
   } catch (e) {
     console.error("LOG_WRITE_FAILED", e?.message || e);
   }
+
   if (level === "error") console.error(entry);
   else if (level === "warn") console.warn(entry);
   else console.log(entry);
@@ -84,27 +88,49 @@ process.on("uncaughtException", (e) => {
   log("error", "uncaughtException", { message: e?.message, stack: e?.stack });
   process.exit(1);
 });
+
 process.on("unhandledRejection", (e) => {
   log("error", "unhandledRejection", { message: e?.message, stack: e?.stack });
   process.exit(1);
 });
 
 /** =========================
- * DB
+ * MONGOOSE
  * ========================= */
-const db = new Database("wg.db");
-db.pragma("journal_mode = WAL");
-db.exec(`
-CREATE TABLE IF NOT EXISTS clients (
-  id TEXT PRIMARY KEY,
-  name TEXT,
-  public_key TEXT UNIQUE NOT NULL,
-  private_key TEXT,
-  ip TEXT UNIQUE NOT NULL,
-  created_at TEXT NOT NULL,
-  revoked INTEGER NOT NULL DEFAULT 0
+const clientSchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true, unique: true, index: true },
+    name: { type: String, default: "client", trim: true },
+
+    username: {
+      type: String,
+      required: true,
+      unique: true,
+      trim: true,
+      minlength: 3,
+      maxlength: 64
+    },
+
+    passwordHash: {
+      type: String,
+      required: true
+    },
+
+    publicKey: { type: String, required: true, unique: true, index: true },
+    privateKey: { type: String, default: null },
+    ip: { type: String, required: true, unique: true, index: true },
+    createdAt: { type: Date, required: true, default: Date.now },
+    revoked: { type: Boolean, required: true, default: false }
+  },
+  {
+    versionKey: false,
+    collection: "clients"
+  }
 );
-`);
+
+clientSchema.index({ username: 1 }, { unique: true });
+
+const Client = mongoose.model("Client", clientSchema);
 
 /** =========================
  * HELPERS
@@ -123,14 +149,15 @@ function generateKeypair() {
   return { privateKey, publicKey };
 }
 
-function allocateIP() {
-  const used = new Set(
-    db.prepare("SELECT ip FROM clients WHERE revoked=0").all().map((r) => r.ip)
-  );
+async function allocateIP() {
+  const rows = await Client.find({ revoked: false }, { ip: 1, _id: 0 }).lean();
+  const used = new Set(rows.map((r) => r.ip));
+
   for (let i = 2; i <= 254; i++) {
     const ip = `${CONFIG.VPN_IP_PREFIX}${i}`;
     if (!used.has(ip)) return ip;
   }
+
   throw new Error("IP pool exhausted");
 }
 
@@ -159,9 +186,16 @@ PersistentKeepalive = 25
 `;
 }
 
-function syncDbPeersToWireGuard() {
-  const peers = db.prepare("SELECT public_key, ip FROM clients WHERE revoked=0").all();
-  for (const p of peers) wgAddPeer(p.public_key, p.ip);
+async function syncDbPeersToWireGuard() {
+  const peers = await Client.find(
+    { revoked: false },
+    { publicKey: 1, ip: 1, _id: 0 }
+  ).lean();
+
+  for (const p of peers) {
+    wgAddPeer(p.publicKey, p.ip);
+  }
+
   return peers.length;
 }
 
@@ -178,11 +212,16 @@ function signToken(username) {
 
 function authRequired(req, res, next) {
   const h = req.headers.authorization || "";
-  if (!h.startsWith("Bearer ")) return res.status(401).json({ error: "missing_token" });
+  if (!h.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "missing_token" });
+  }
 
   const token = h.slice(7).trim();
+
   try {
-    req.user = jwt.verify(token, CONFIG.JWT.SECRET, { issuer: CONFIG.JWT.ISSUER });
+    req.user = jwt.verify(token, CONFIG.JWT.SECRET, {
+      issuer: CONFIG.JWT.ISSUER
+    });
     return next();
   } catch {
     return res.status(401).json({ error: "invalid_or_expired_token" });
@@ -195,21 +234,13 @@ function authRequired(req, res, next) {
 const app = express();
 app.use(express.json());
 
-
-
-app.use(cors({
-  origin: "*",
-  methods: ["GET", "POST", "DELETE", "PUT", "PATCH", "OPTIONS"],
-  allowedHeaders: ["Authorization", "Content-Type"],
-}));
-
 /**
- * CORS explicitly DISABLED
- * - no Access-Control-Allow-* headers are set
- * - OPTIONS is rejected (preflight blocked)
+ * CORS explicitly disabled
  */
 app.use((req, res, next) => {
-  if (req.method === "OPTIONS") return res.status(403).end();
+  if (req.method === "OPTIONS") {
+    return res.status(403).json({ error: "cors_preflight_blocked" });
+  }
   return next();
 });
 
@@ -234,95 +265,251 @@ app.use((req, res, next) => {
 });
 
 /** ---------- PUBLIC ---------- */
-app.get("/health", (_req, res) => res.json({ ok: true }));
-
-app.post("/auth/login", (req, res) => {
-  const username = (req.body?.username || "").toString();
-  const password = (req.body?.password || "").toString();
-
-  const ok =
-    username === CONFIG.ADMIN.USERNAME &&
-    bcrypt.compareSync(password, CONFIG.ADMIN.PASSWORD_BCRYPT);
-
-  if (!ok) {
-    log("warn", "login_failed", { username });
-    return res.status(401).json({ error: "invalid_credentials" });
-  }
-
-  const token = signToken(username);
-  log("info", "login_success", { username });
-
-  return res.json({ tokenType: "Bearer", token, expiresIn: CONFIG.JWT.EXPIRES_IN });
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    mongo: mongoose.connection.readyState === 1
+    });
 });
 
-/** ---------- PROTECTED RESOURCES UNDER /api ---------- */
+app.post("/auth/login", async (req, res, next) => {
+  try {
+    const username = (req.body?.username || "").toString().trim();
+    const password = (req.body?.password || "").toString();
+
+    const admin = await Admin.findOne({ username, isActive: true }).lean();
+
+    if (!admin) {
+      log("warn", "login_failed", { username, reason: "user_not_found" });
+      return res.status(401).json({ error: "invalid_credentials" });
+    }
+
+    const ok = bcrypt.compareSync(password, admin.passwordHash);
+
+    if (!ok) {
+      log("warn", "login_failed", { username, reason: "bad_password" });
+      return res.status(401).json({ error: "invalid_credentials" });
+    }
+
+    const token = signToken(admin.username);
+    log("info", "login_success", { username: admin.username });
+
+    return res.json({
+      tokenType: "Bearer",
+      token,
+      expiresIn: CONFIG.JWT.EXPIRES_IN
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/** ---------- PROTECTED ---------- */
 const api = express.Router();
 api.use(authRequired);
 
 // POST /api/clients
-api.post("/clients", (req, res) => {
-  const name = (req.body?.name || "client").toString();
-  const id = nanoid(10);
-  const ip = allocateIP();
-  const { privateKey, publicKey } = generateKeypair();
+api.post("/clients", async (req, res, next) => {
+  try {
+    const name = (req.body?.name || "client").toString().trim();
+    const username = (req.body?.username || "").toString().trim();
+    const password = (req.body?.password || "").toString();
 
-  wgAddPeer(publicKey, ip);
+    if (!username) {
+      return res.status(400).json({ error: "username_required" });
+    }
 
-  db.prepare(`
-    INSERT INTO clients (id, name, public_key, private_key, ip, created_at, revoked)
-    VALUES (?, ?, ?, ?, ?, ?, 0)
-  `).run(id, name, publicKey, privateKey, ip, new Date().toISOString());
+    if (username.length < 3) {
+      return res.status(400).json({ error: "username_too_short" });
+    }
 
-  res.json({ id, name, ip, publicKey, config: buildClientConfig(privateKey, ip) });
+    if (!password) {
+      return res.status(400).json({ error: "password_required" });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({ error: "password_too_short" });
+    }
+
+    const id = nanoid(10);
+    const ip = await allocateIP();
+    const { privateKey, publicKey } = generateKeypair();
+    const passwordHash = bcrypt.hashSync(password, 10);
+
+    const client = await Client.create({
+      id,
+      name,
+      username,
+      passwordHash,
+      publicKey,
+      privateKey,
+      ip,
+      createdAt: new Date(),
+      revoked: false
+    });
+
+    try {
+      wgAddPeer(publicKey, ip);
+    } catch (e) {
+      await Client.deleteOne({ _id: client._id });
+      throw e;
+    }
+
+    return res.json({
+      id,
+      name,
+      username,
+      ip,
+      publicKey,
+      config: buildClientConfig(privateKey, ip)
+    });
+  } catch (err) {
+    if (err?.code === 11000) {
+      if (err?.keyPattern?.username) {
+        return res.status(409).json({ error: "username_already_exists" });
+      }
+      return res.status(409).json({ error: "duplicate_client_or_ip" });
+    }
+    return next(err);
+  }
 });
 
 // POST /api/clients/by-public-key
-api.post("/clients/by-public-key", (req, res) => {
-  const name = (req.body?.name || "client").toString();
-  const publicKey = (req.body?.publicKey || "").toString().trim();
-  if (!isLikelyWGKey(publicKey)) return res.status(400).json({ error: "invalid_public_key" });
+api.post("/clients/by-public-key", async (req, res, next) => {
+  try {
+    const name = (req.body?.name || "client").toString().trim();
+    const username = (req.body?.username || "").toString().trim();
+    const password = (req.body?.password || "").toString();
+    const publicKey = (req.body?.publicKey || "").toString().trim();
 
-  const id = nanoid(10);
-  const ip = allocateIP();
+    if (!username) {
+      return res.status(400).json({ error: "username_required" });
+    }
 
-  wgAddPeer(publicKey, ip);
+    if (username.length < 3) {
+      return res.status(400).json({ error: "username_too_short" });
+    }
 
-  db.prepare(`
-    INSERT INTO clients (id, name, public_key, private_key, ip, created_at, revoked)
-    VALUES (?, ?, ?, NULL, ?, ?, 0)
-  `).run(id, name, publicKey, ip, new Date().toISOString());
+    if (!password) {
+      return res.status(400).json({ error: "password_required" });
+    }
 
-  res.json({ id, name, ip, publicKey });
+    if (password.length < 6) {
+      return res.status(400).json({ error: "password_too_short" });
+    }
+
+    if (!isLikelyWGKey(publicKey)) {
+      return res.status(400).json({ error: "invalid_public_key" });
+    }
+
+    const id = nanoid(10);
+    const ip = await allocateIP();
+    const passwordHash = bcrypt.hashSync(password, 10);
+
+    const client = await Client.create({
+      id,
+      name,
+      username,
+      passwordHash,
+      publicKey,
+      privateKey: null,
+      ip,
+      createdAt: new Date(),
+      revoked: false
+    });
+
+    try {
+      wgAddPeer(publicKey, ip);
+    } catch (e) {
+      await Client.deleteOne({ _id: client._id });
+      throw e;
+    }
+
+    return res.json({
+      id,
+      name,
+      username,
+      ip,
+      publicKey
+    });
+  } catch (err) {
+    if (err?.code === 11000) {
+      if (err?.keyPattern?.username) {
+        return res.status(409).json({ error: "username_already_exists" });
+      }
+      return res.status(409).json({ error: "duplicate_client_or_ip" });
+    }
+    return next(err);
+  }
 });
 
 // GET /api/clients
-api.get("/clients", (_req, res) => {
-  const rows = db.prepare(`
-    SELECT id, name, public_key AS publicKey, ip, created_at AS createdAt, revoked
-    FROM clients
-    ORDER BY created_at DESC
-  `).all();
-  res.json(rows);
+api.get("/clients", async (_req, res, next) => {
+  try {
+    const rows = await Client.find(
+      {},
+      {
+        _id: 0,
+        id: 1,
+        name: 1,
+        username: 1,
+        publicKey: 1,
+        ip: 1,
+        createdAt: 1,
+        revoked: 1
+      }
+    )
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const data = rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      username: r.username,
+      publicKey: r.publicKey,
+      ip: r.ip,
+      createdAt:
+        r.createdAt instanceof Date ? r.createdAt.toISOString() : r.createdAt,
+      revoked: r.revoked
+    }));
+
+    return res.json(data);
+  } catch (err) {
+    return next(err);
+  }
 });
 
 // DELETE /api/clients/:id
-api.delete("/clients/:id", (req, res) => {
-  const id = req.params.id;
-  const row = db.prepare("SELECT public_key, revoked FROM clients WHERE id=?").get(id);
+api.delete("/clients/:id", async (req, res, next) => {
+  try {
+    const id = req.params.id;
+    const row = await Client.findOne({ id }).lean();
 
-  if (!row) return res.status(404).json({ error: "not_found" });
-  if (row.revoked) return res.json({ ok: true, alreadyRevoked: true });
+    if (!row) {
+      return res.status(404).json({ error: "not_found" });
+    }
 
-  wgRemovePeer(row.public_key);
-  db.prepare("UPDATE clients SET revoked=1 WHERE id=?").run(id);
+    if (row.revoked) {
+      return res.json({ ok: true, alreadyRevoked: true });
+    }
 
-  res.json({ ok: true });
+    wgRemovePeer(row.publicKey);
+    await Client.updateOne({ id }, { $set: { revoked: true } });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    return next(err);
+  }
 });
 
 // POST /api/sync
-api.post("/sync", (_req, res) => {
-  const count = syncDbPeersToWireGuard();
-  res.json({ ok: true, appliedPeers: count });
+api.post("/sync", async (_req, res, next) => {
+  try {
+    const count = await syncDbPeersToWireGuard();
+    return res.json({ ok: true, appliedPeers: count });
+  } catch (err) {
+    return next(err);
+  }
 });
 
 app.use("/api", api);
@@ -341,24 +528,42 @@ app.use((err, req, res, _next) => {
 });
 
 /** ---------- BOOT ---------- */
-try {
-  const applied = syncDbPeersToWireGuard();
-  log("info", "startupSyncComplete", { appliedPeers: applied });
-} catch (e) {
-  log("error", "startupSyncFailed", { message: e?.message, stack: e?.stack });
+async function boot() {
+  try {
+    await mongoose.connect(CONFIG.MONGODB_URI);
+    log("info", "mongodb_connected", { db: mongoose.connection.name });
+
+    try {
+      const applied = await syncDbPeersToWireGuard();
+      log("info", "startupSyncComplete", { appliedPeers: applied });
+    } catch (e) {
+      log("error", "startupSyncFailed", {
+        message: e?.message,
+        stack: e?.stack
+      });
+    }
+
+    app.listen(CONFIG.API_PORT, () => {
+      log("info", "server_started", {
+        port: CONFIG.API_PORT,
+        public: ["GET /health", "POST /auth/login"],
+        protected: [
+          "POST /api/clients",
+          "POST /api/clients/by-public-key",
+          "GET /api/clients",
+          "DELETE /api/clients/:id",
+          "POST /api/sync"
+        ],
+        cors: "disabled"
+      });
+    });
+  } catch (e) {
+    log("error", "mongodb_connection_failed", {
+      message: e?.message,
+      stack: e?.stack
+    });
+    process.exit(1);
+  }
 }
 
-app.listen(CONFIG.API_PORT, () => {
-  log("info", "server_started", {
-    port: CONFIG.API_PORT,
-    public: ["GET /health", "POST /auth/login"],
-    protected: [
-      "POST /api/clients",
-      "POST /api/clients/by-public-key",
-      "GET /api/clients",
-      "DELETE /api/clients/:id",
-      "POST /api/sync"
-    ],
-    cors: "disabled"
-  });
-});
+boot();
