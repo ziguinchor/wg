@@ -30,13 +30,6 @@ import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import cors from "cors";
 
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"]
-  })
-);
 
 import Admin from "./models/Admin.js";
 
@@ -242,6 +235,14 @@ function authRequired(req, res, next) {
  * ========================= */
 const app = express();
 app.use(express.json());
+
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
+
+app.options("*", cors());
 
 
 // Request log
