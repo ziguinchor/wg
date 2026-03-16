@@ -163,9 +163,42 @@ async function allocateIP() {
   throw new Error("IP pool exhausted");
 }
 
+// function wgAddPeer(publicKey, ip) {
+//   sh("wg", ["set", CONFIG.WG_IFACE, "peer", publicKey, "allowed-ips", `${ip}/32`]);
+//   log("info", "wgAddPeer", { publicKey, ip, iface: CONFIG.WG_IFACE });
+// }
+
 function wgAddPeer(publicKey, ip) {
-  sh("wg", ["set", CONFIG.WG_IFACE, "peer", publicKey, "allowed-ips", `${ip}/32`]);
-  log("info", "wgAddPeer", { publicKey, ip, iface: CONFIG.WG_IFACE });
+
+  const peerBlock = `
+[Peer]
+PublicKey = ${publicKey}
+AllowedIPs = ${ip}/32
+`;
+
+  try {
+    // 1️⃣ Add to running WireGuard interface
+    sh("wg", ["set", CONFIG.WG_IFACE, "peer", publicKey, "allowed-ips", `${ip}/32`]);
+
+    // 2️⃣ Append peer to wg0.conf
+    const confPath = "/etc/wireguard/wg0.conf";
+    fs.appendFileSync(confPath, peerBlock);
+
+    log("info", "wgAddPeer", {
+      publicKey,
+      ip,
+      iface: CONFIG.WG_IFACE,
+      persisted: true
+    });
+
+  } catch (err) {
+    log("error", "wgAddPeerFailed", {
+      publicKey,
+      ip,
+      error: err.message
+    });
+    throw err;
+  }
 }
 
 function wgRemovePeer(publicKey) {
