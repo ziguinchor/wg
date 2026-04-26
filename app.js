@@ -390,13 +390,17 @@ api.post("/clients", async (req, res, next) => {
     }
 
     return res.json({
-      id,
-      name,
-      username,
-      ip,
-      publicKey,
-      config: buildClientConfig(privateKey, ip)
+      private_key: privateKey,
+      client_public_key: publicKey,
+      server_public_key: CONFIG.SERVER_PUBLIC_KEY,
+      address: `${ip}/24`,
+      dns: CONFIG.DNS,
+      mtu: CONFIG.CLIENT_MTU,
+      allowed_ips: "0.0.0.0/0, ::/0",
+      endpoint: CONFIG.SERVER_ENDPOINT,
+      persistent_keepalive: 25
     });
+    
   } catch (err) {
     if (err?.code === 11000) {
       if (err?.keyPattern?.username) {
