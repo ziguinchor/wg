@@ -113,7 +113,7 @@ const clientSchema = new mongoose.Schema(
       maxlength: 64
     },
 
-    passwordHash: {
+    password: {
       type: String,
       required: true
     },
@@ -381,13 +381,12 @@ api.post("/clients", async (req, res, next) => {
     const id = nanoid(10);
     const ip = await allocateIP();
     const { privateKey, publicKey } = generateKeypair();
-    const passwordHash = bcrypt.hashSync(password, 10);
 
     const client = await Client.create({
       id,
       name,
       username,
-      passwordHash,
+      password,
       publicKey,
       privateKey,
       ip,
@@ -468,13 +467,12 @@ api.post("/clients/by-public-key", async (req, res, next) => {
 
     const id = nanoid(10);
     const ip = await allocateIP();
-    const passwordHash = bcrypt.hashSync(password, 10);
 
     const client = await Client.create({
       id,
       name,
       username,
-      passwordHash,
+      password,
       publicKey,
       privateKey: null,
       ip,
@@ -518,6 +516,7 @@ api.get("/clients", async (_req, res, next) => {
         id: 1,
         name: 1,
         username: 1,
+        password: 1,
         publicKey: 1,
         ip: 1,
         createdAt: 1,
@@ -532,6 +531,7 @@ api.get("/clients", async (_req, res, next) => {
       id: r.id,
       name: r.name,
       username: r.username,
+      password: r.password,
       publicKey: r.publicKey,
       ip: r.ip,
       createdAt:
