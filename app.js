@@ -122,6 +122,7 @@ const clientSchema = new mongoose.Schema(
     privateKey: { type: String, default: null },
     ip: { type: String, required: true, unique: true, index: true },
     createdAt: { type: Date, required: true, default: Date.now },
+    expiresAt: { type: Date, default: null },
     revoked: { type: Boolean, required: true, default: false }
   },
   {
@@ -348,6 +349,7 @@ api.post("/clients", async (req, res, next) => {
     const name = (req.body?.name || "client").toString().trim();
     const username = (req.body?.username || "").toString().trim();
     const password = (req.body?.password || "").toString();
+    const expiresAtRaw = req.body?.expiresAt ?? null;
 
     if (!username) {
       return res.status(400).json({ error: "username_required" });
@@ -365,6 +367,17 @@ api.post("/clients", async (req, res, next) => {
       return res.status(400).json({ error: "password_too_short" });
     }
 
+    let expiresAt = null;
+    if (expiresAtRaw !== null && expiresAtRaw !== "") {
+      expiresAt = new Date(expiresAtRaw);
+      if (isNaN(expiresAt.getTime())) {
+        return res.status(400).json({ error: "invalid_expires_at" });
+      }
+      if (expiresAt <= new Date()) {
+        return res.status(400).json({ error: "expires_at_must_be_future" });
+      }
+    }
+
     const id = nanoid(10);
     const ip = await allocateIP();
     const { privateKey, publicKey } = generateKeypair();
@@ -379,6 +392,7 @@ api.post("/clients", async (req, res, next) => {
       privateKey,
       ip,
       createdAt: new Date(),
+      expiresAt,
       revoked: false
     });
 
@@ -419,6 +433,7 @@ api.post("/clients/by-public-key", async (req, res, next) => {
     const username = (req.body?.username || "").toString().trim();
     const password = (req.body?.password || "").toString();
     const publicKey = (req.body?.publicKey || "").toString().trim();
+    const expiresAtRaw = req.body?.expiresAt ?? null;
 
     if (!username) {
       return res.status(400).json({ error: "username_required" });
@@ -440,6 +455,17 @@ api.post("/clients/by-public-key", async (req, res, next) => {
       return res.status(400).json({ error: "invalid_public_key" });
     }
 
+    let expiresAt = null;
+    if (expiresAtRaw !== null && expiresAtRaw !== "") {
+      expiresAt = new Date(expiresAtRaw);
+      if (isNaN(expiresAt.getTime())) {
+        return res.status(400).json({ error: "invalid_expires_at" });
+      }
+      if (expiresAt <= new Date()) {
+        return res.status(400).json({ error: "expires_at_must_be_future" });
+      }
+    }
+
     const id = nanoid(10);
     const ip = await allocateIP();
     const passwordHash = bcrypt.hashSync(password, 10);
@@ -453,6 +479,7 @@ api.post("/clients/by-public-key", async (req, res, next) => {
       privateKey: null,
       ip,
       createdAt: new Date(),
+      expiresAt,
       revoked: false
     });
 
@@ -494,6 +521,7 @@ api.get("/clients", async (_req, res, next) => {
         publicKey: 1,
         ip: 1,
         createdAt: 1,
+        expiresAt: 1,
         revoked: 1
       }
     )
@@ -508,6 +536,7 @@ api.get("/clients", async (_req, res, next) => {
       ip: r.ip,
       createdAt:
         r.createdAt instanceof Date ? r.createdAt.toISOString() : r.createdAt,
+      expiresAt: r.expiresAt instanceof Date ? r.expiresAt.toISOString() : (r.expiresAt ?? null),
       revoked: r.revoked
     }));
 
@@ -580,6 +609,28 @@ async function boot() {
         stack: e?.stack
       });
     }
+
+    setInterval(async () => {
+      try {
+        const now = new Date();
+        const expired = await Client.find({
+          revoked: false,
+          expiresAt: { $lte: now, $ne: null }
+        }).lean();
+
+        for (const peer of expired) {
+          try {
+            wgRemovePeer(peer.publicKey);
+          } catch (e) {
+            log("warn", "expiry_wg_remove_failed", { id: peer.id, message: e?.message });
+          }
+          await Client.updateOne({ id: peer.id }, { $set: { revoked: true } });
+          log("info", "peer_expired", { id: peer.id, username: peer.username });
+        }
+      } catch (e) {
+        log("error", "expiry_check_failed", { message: e?.message });
+      }
+    }, 60_000);
 
     app.listen(CONFIG.API_PORT, () => {
       log("info", "server_started", {
